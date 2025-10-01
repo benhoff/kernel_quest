@@ -154,6 +154,30 @@ static void broadcast_room(u32 room_id, const char *fmt, ...)
 	mutex_unlock(&world_lock);
 }
 
+static void broadcast_room_locked(u32 room_id, const char *fmt, ...)
+{
+	char buf[MONSTER_MAX_LINE];
+	va_list ap;
+	int n;
+
+	va_start(ap, fmt);
+	n = vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+
+	/* walk sessions, check if player in room_id */
+	{
+		struct monster_session *s;
+		list_for_each_entry(s, &sessions, list) {
+			if (!s->player) continue;
+			if (s->player->room_id != room_id) continue;
+			mutex_lock(&s->out_lock);
+			kfifo_in(&s->out, buf, n);
+			mutex_unlock(&s->out_lock);
+			wake_up_interruptible(&s->wq);
+		}
+	}
+}
+
 /* ---- World ops --------------------------------------------------------- */
 
 static void place_actor_in_room(struct actor *a, int new_room)
@@ -292,9 +316,7 @@ static void cmd_say(struct monster_session *s, const char *msg)
 {
 	if (!s->player) { sess_emit(s, "login first\n"); return; }
 	if (!msg) msg = "";
-	mutex_lock(&world_lock);
 	broadcast_room(s->player->room_id, "%s says: %s\n", s->player->name, msg);
-	mutex_unlock(&world_lock);
 }
 
 static void cmd_hide(struct monster_session *s)
@@ -335,7 +357,7 @@ static void cmd_fight(struct monster_session *s)
 				sess_emit(s, "You collapse. Darkness takes you...\n");
 				place_actor_in_room(s->player, 0);
 				s->player->hp = 5;
-				broadcast_room(rid, "%s falls and is dragged away...\n", s->player->name);
+				broadcast_room_locked(rid, "%s falls and is dragged away...\n", s->player->name);
 				sess_emit(s, "You awaken in %s.\n", rooms[0].name);
 				cmd_look(s);
 			}
