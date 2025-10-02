@@ -93,6 +93,7 @@ static const char *dir_name(enum dir d) {
 		case S: return "south"; case W: return "west"; default: return "?"; }
 }
 static int room_exit(int rid, enum dir d) { return rooms[rid].exits[d]; }
+static inline enum dir opposite_dir(enum dir d) { return (d + 2) % DIRS; }
 
 static void sess_emit_locked(struct monster_session *s, const char *fmt, ...)
 {
@@ -222,34 +223,7 @@ static void look_room_unlocked(struct monster_session *s)
 		sess_emit(s, "The monster is here. (fight/hide?)\n");
 }
 
-static void monster_move_unlocked(void)
-{
-	/* simple: every few ticks, move via a random available exit */
-	if (mon.cooldown_ticks > 0) { mon.cooldown_ticks--; return; }
-
-	/* choose a random available direction */
-	int tries = 8;
-	while (tries--) {
-		u8 d;
-		get_random_bytes(&d, 1);
-		d %= DIRS;
-		{
-			int dst = room_exit(mon.room_id, d);
-			if (dst >= 0) {
-				int prev = mon.room_id;
-				mon.room_id = dst;
-				mon.cooldown_ticks = 12; /* ~3s at 250ms tick */
-				/* broadcast leave/enter */
-				broadcast_room(prev, "The monster shuffles %s.\n", dir_name(d));
-				broadcast_room(mon.room_id, "The monster enters %s!\n", rooms[mon.room_id].name);
-				break;
-			}
-		}
-	}
-}
-
 /* ---- Command parsing --------------------------------------------------- */
-
 static void cmd_login(struct monster_session *s, const char *arg)
 {
 	if (s->player) { sess_emit(s, "Already logged in.\n"); return; }
@@ -379,41 +353,53 @@ static void cmd_who(struct monster_session *s)
 }
 
 /* ---- Ticking ----------------------------------------------------------- */
-
 static void monster_tick_work(struct work_struct *w)
 {
-    int prev, new;
-    bool moved = false;
+	int prev = -1, next = -1;
+	enum dir moved_dir = NONE;
+	bool moved = false;
 
-    mutex_lock(&world_lock);
-    if (mon.cooldown_ticks > 0) {
-        mon.cooldown_ticks--;
-    } else {
-        int tries = 8;
-        while (tries--) {
-            u8 d;
-            get_random_bytes(&d, 1);
-            d %= DIRS;
-            int dst = room_exit(mon.room_id, d);
-            if (dst >= 0) {
-                prev = mon.room_id;
-                new  = dst;
-                mon.room_id = dst;
-                mon.cooldown_ticks = 12;
-                moved = true;
-                break;
-            }
-        }
-    }
-    mutex_unlock(&world_lock);
+	mutex_lock(&world_lock);
 
-    if (moved) {
-        broadcast_room(prev, "The monster shuffles...\n");
-        broadcast_room(new,  "The monster enters %s!\n", rooms[new].name);
-    }
+	if (mon.cooldown_ticks > 0) {
+		mon.cooldown_ticks--;
+	} else {
+		int tries = 8;
+		while (tries--) {
+			u8 d;
+			get_random_bytes(&d, 1);
+			d %= DIRS;
 
-    schedule_delayed_work(&tick_work, msecs_to_jiffies(250));
+			/* Is there an exit that way? */
+			{
+				int dst = room_exit(mon.room_id, d);
+				if (dst >= 0) {
+					prev = mon.room_id;
+					next = dst;
+					mon.room_id = dst;
+					mon.cooldown_ticks = 12; /* ~3s at 250ms tick */
+					moved_dir = (enum dir)d;
+					moved = true;
+					break;
+				}
+			}
+		}
+	}
+
+	mutex_unlock(&world_lock);
+
+	if (moved) {
+		/* Clear, directional messaging */
+		broadcast_room(prev,
+			"The monster leaves to the %s.\n", dir_name(moved_dir));
+		broadcast_room(next,
+			"The monster enters from the %s!\n", dir_name(opposite_dir(moved_dir)));
+
+	}
+
+	schedule_delayed_work(&tick_work, msecs_to_jiffies(250));
 }
+
 
 /* ---- Char device fops -------------------------------------------------- */
 
