@@ -50,6 +50,9 @@ static int set_tick_ms(const char *val, const struct kernel_param *kp)
     v = clamp_tick_ms(v);
     *(unsigned int *)kp->arg = v;
 
+    if (!READ_ONCE(tick_work_ready))
+	    return 0;
+
     if (v == 0) {  /* pause */
         cancel_delayed_work_sync(&tick_work);
         pr_info("monster: ticks paused (tick_ms=0)\n");
@@ -644,7 +647,7 @@ static int __init monster_init(void)
 	}
 	/* monster start */
 	mon.room_id = room_valid(start_room) ? start_room : 0;
-	mon.cooldown_ticks = 4;
+	mon.cooldown_ticks = move_cooldown_ticks;
 	mon.alive = 1;
 
 	INIT_DELAYED_WORK(&tick_work, monster_tick_work);
