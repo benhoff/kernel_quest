@@ -23,6 +23,71 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("you");
 MODULE_DESCRIPTION("Kernel monster (char device) — 'Monster in the Dark'");
 
+
+/* ---- Tunables --------------------------------------------------------- */
+/* Tick interval for the game loop (ms) */
+static unsigned int tick_ms = 250;
+static struct delayed_work tick_work;
+static bool tick_work_ready;
+
+static unsigned int clamp_tick_ms(unsigned int v)
+{
+    unsigned int min = jiffies_to_msecs(1);      /* 1 jiffy: ~1/HZ (e.g., 4–10 ms) */
+    unsigned int max = 60 * 1000;                /* cap to 60s (tweak as you like) */
+    if (v == 0) return 0;                        /* 0 = paused */
+    if (v < min) return min;
+    if (v > max) return max;
+    return v;
+}
+
+/* live setter: validates and re-arms the worker */
+static int set_tick_ms(const char *val, const struct kernel_param *kp)
+{
+    unsigned int v = tick_ms;
+    int ret = kstrtouint(val, 0, &v);
+    if (ret) return ret;
+
+    v = clamp_tick_ms(v);
+    *(unsigned int *)kp->arg = v;
+
+    if (v == 0) {  /* pause */
+        cancel_delayed_work_sync(&tick_work);
+        pr_info("monster: ticks paused (tick_ms=0)\n");
+    } else {
+        /* re-arm relative to now; safe from any context */
+        unsigned long delay = msecs_to_jiffies(v);
+        if (delay == 0) delay = 1;
+        /* re-arm relative to now */
+        mod_delayed_work(system_wq, &tick_work, delay);
+        pr_info("monster: tick interval set to %u ms (min=%u ms)\n",
+                v, max(1u, jiffies_to_msecs(1)));
+    }
+    return 0;
+}
+
+static const struct kernel_param_ops tick_ops = {
+    .set = set_tick_ms,
+    .get = param_get_uint,
+};
+
+module_param_cb(tick_ms, &tick_ops, &tick_ms, 0644);
+MODULE_PARM_DESC(tick_ms, "Game tick interval in ms (0=paused; clamped to [1 jiffy, 60s])");
+
+/* Monster movement cooldown, in ticks (uses tick_ms as the unit) */
+static unsigned int move_cooldown_ticks = 12;
+module_param(move_cooldown_ticks, uint, 0644);
+MODULE_PARM_DESC(move_cooldown_ticks, "Monster move cooldown in ticks (default 12)");
+
+/* Where the monster starts (room id) */
+static int start_room = 1;
+module_param(start_room, int, 0644);
+MODULE_PARM_DESC(start_room, "Initial monster room id (default 1)");
+
+/* Optional deterministic RNG seed (0 = use kernel randomness) */
+static unsigned int rng_seed = 0;
+module_param(rng_seed, uint, 0644);
+MODULE_PARM_DESC(rng_seed, "Deterministic RNG seed (0 disables)");
+
 /* ---- World model ------------------------------------------------------- */
 
 enum dir { N=0, E=1, S=2, W=3, DIRS=4, NONE=255 };
@@ -84,7 +149,6 @@ static struct list_head room_lists[ROOM_COUNT];
 
 static struct monster_state mon;
 
-static struct delayed_work tick_work;
 
 /* ---- Helpers ----------------------------------------------------------- */
 
@@ -104,6 +168,10 @@ static enum dir direction_to(int from_room, int to_room)
 	return NONE;
 }
 
+static inline bool room_valid(int rid)
+{
+	return rid >= 0 && rid < ROOM_COUNT;
+}
 
 static void sess_emit_locked(struct monster_session *s, const char *fmt, ...)
 {
@@ -387,7 +455,7 @@ static void monster_tick_work(struct work_struct *w)
 					prev = mon.room_id;
 					next = dst;
 					mon.room_id = dst;
-					mon.cooldown_ticks = 12; /* ~3s at 250ms tick */
+					mon.cooldown_ticks = move_cooldown_ticks;
 					moved_dir = (enum dir)d; /* direction from prev */
 					moved = true;
 					break;
@@ -417,7 +485,13 @@ static void monster_tick_work(struct work_struct *w)
 		}
 	}
 
-	schedule_delayed_work(&tick_work, msecs_to_jiffies(250));
+        unsigned int t = READ_ONCE(tick_ms);
+        if (t)  /* never schedule with 0 delay */
+	{
+		unsigned long delay = msecs_to_jiffies(t);
+		if (delay == 0) delay = 1;
+		schedule_delayed_work(&tick_work, delay);
+	}
 }
 
 
@@ -569,10 +643,19 @@ static int __init monster_init(void)
 		rooms[i].id = i;
 	}
 	/* monster start */
-	mon.room_id = 1; mon.cooldown_ticks = 4; mon.alive = 1;
+	mon.room_id = room_valid(start_room) ? start_room : 0;
+	mon.cooldown_ticks = 4;
+	mon.alive = 1;
 
 	INIT_DELAYED_WORK(&tick_work, monster_tick_work);
-	schedule_delayed_work(&tick_work, msecs_to_jiffies(250));
+	WRITE_ONCE(tick_work_ready, true);
+	tick_ms = clamp_tick_ms(tick_ms);
+	if (tick_ms) {
+		unsigned long delay = msecs_to_jiffies(tick_ms);
+		if (delay == 0) delay = 1;
+		schedule_delayed_work(&tick_work, delay);
+	}
+	pr_info("monster: loaded (tick_ms=%u ms, min=%u ms)\n", tick_ms, jiffies_to_msecs(1));
 
 	ret = misc_register(&monster_miscdev);
 	if (ret) {
@@ -586,6 +669,7 @@ static int __init monster_init(void)
 
 static void __exit monster_exit(void)
 {
+	WRITE_ONCE(tick_work_ready, false);
 	cancel_delayed_work_sync(&tick_work);
 
 	/* free sessions & actors */
