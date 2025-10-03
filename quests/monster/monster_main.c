@@ -94,6 +94,16 @@ static const char *dir_name(enum dir d) {
 }
 static int room_exit(int rid, enum dir d) { return rooms[rid].exits[d]; }
 static inline enum dir opposite_dir(enum dir d) { return (d + 2) % DIRS; }
+static enum dir direction_to(int from_room, int to_room)
+{
+	int d;
+	for (d = 0; d < DIRS; d++) {
+		if (rooms[from_room].exits[d] == to_room)
+			return (enum dir)d;
+	}
+	return NONE;
+}
+
 
 static void sess_emit_locked(struct monster_session *s, const char *fmt, ...)
 {
@@ -370,7 +380,7 @@ static void monster_tick_work(struct work_struct *w)
 			get_random_bytes(&d, 1);
 			d %= DIRS;
 
-			/* Is there an exit that way? */
+			/* candidate exit? */
 			{
 				int dst = room_exit(mon.room_id, d);
 				if (dst >= 0) {
@@ -378,7 +388,7 @@ static void monster_tick_work(struct work_struct *w)
 					next = dst;
 					mon.room_id = dst;
 					mon.cooldown_ticks = 12; /* ~3s at 250ms tick */
-					moved_dir = (enum dir)d;
+					moved_dir = (enum dir)d; /* direction from prev */
 					moved = true;
 					break;
 				}
@@ -389,12 +399,22 @@ static void monster_tick_work(struct work_struct *w)
 	mutex_unlock(&world_lock);
 
 	if (moved) {
-		/* Clear, directional messaging */
+		/* Leaving is always the direction we took from prev */
 		broadcast_room(prev,
 			"The monster leaves to the %s.\n", dir_name(moved_dir));
-		broadcast_room(next,
-			"The monster enters from the %s!\n", dir_name(opposite_dir(moved_dir)));
 
+		/* Entering: compute direction as seen from the destination */
+		{
+			enum dir enter_from = direction_to(next, prev);
+			if (enter_from != NONE) {
+				broadcast_room(next,
+					"The monster enters from the %s!\n", dir_name(enter_from));
+			} else {
+				/* No reverse edge; avoid claiming an impossible side */
+				broadcast_room(next,
+					"The monster enters %s!\n", rooms[next].name);
+			}
+		}
 	}
 
 	schedule_delayed_work(&tick_work, msecs_to_jiffies(250));
