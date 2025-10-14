@@ -124,7 +124,8 @@ struct actor {
 	u32 room_id;
 	u8  hp;
 	u8  hiding;          /* 1 if hiding this tick window */
-	struct list_head node;  /* for room membership list */
+	struct list_head room_node;  /* room membership */
+	struct list_head world_node; /* global actor roster */
 };
 
 struct monster_session {
@@ -266,10 +267,10 @@ static void place_actor_in_room(struct actor *a, int new_room)
 {
 	/* assumes world_lock held */
 	if (a->room_id < ROOM_COUNT)
-		list_del_init(&a->node);
+		list_del_init(&a->room_node);
 
 	a->room_id = new_room;
-	list_add_tail(&a->node, &room_lists[new_room]);
+	list_add_tail(&a->room_node, &room_lists[new_room]);
 }
 
 static void look_room_unlocked(struct monster_session *s)
@@ -293,7 +294,7 @@ static void look_room_unlocked(struct monster_session *s)
 
 	/* who is here (players) */
 	sess_emit(s, "You see:");
-	list_for_each_entry(a_it, &room_lists[r->id], node) {
+	list_for_each_entry(a_it, &room_lists[r->id], room_node) {
 		if (a_it != s->player)
 			sess_emit(s, " %s", a_it->name);
 	}
@@ -314,11 +315,12 @@ static void cmd_login(struct monster_session *s, const char *arg)
 	if (!a) { sess_emit(s, "No mem\n"); return; }
 	strscpy(a->name, arg, sizeof(a->name));
 	a->hp = 5;
-	INIT_LIST_HEAD(&a->node);
+	INIT_LIST_HEAD(&a->room_node);
+	INIT_LIST_HEAD(&a->world_node);
 
 	mutex_lock(&world_lock);
 	a->id = (u32)(uintptr_t)a; /* lazy unique */
-	list_add_tail(&actors, &a->node); /* (optional: separate list) */
+	list_add_tail(&a->world_node, &actors);
 	place_actor_in_room(a, 0);
 	mutex_unlock(&world_lock);
 
@@ -427,7 +429,7 @@ static void cmd_who(struct monster_session *s)
 	if (!s->player) { sess_emit(s, "login first\n"); return; }
 	mutex_lock(&world_lock);
 	sess_emit(s, "Players here:");
-	list_for_each_entry(a, &room_lists[s->player->room_id], node)
+	list_for_each_entry(a, &room_lists[s->player->room_id], room_node)
 		sess_emit(s, " %s", a->name);
 	sess_emit(s, "\n");
 	mutex_unlock(&world_lock);
@@ -530,7 +532,8 @@ static int monster_release(struct inode *ino, struct file *filp)
 	mutex_lock(&world_lock);
 	list_del_init(&s->list);
 	if (s->player) {
-		list_del_init(&s->player->node);
+		list_del_init(&s->player->room_node);
+		list_del_init(&s->player->world_node);
 		kfree(s->player);
 	}
 	mutex_unlock(&world_lock);
@@ -681,7 +684,8 @@ static void __exit monster_exit(void)
 		struct monster_session *s = list_first_entry(&sessions, struct monster_session, list);
 		list_del_init(&s->list);
 		if (s->player) {
-			list_del_init(&s->player->node);
+			list_del_init(&s->player->room_node);
+			list_del_init(&s->player->world_node);
 			kfree(s->player);
 		}
 		kfifo_free(&s->out);
@@ -695,4 +699,3 @@ static void __exit monster_exit(void)
 
 module_init(monster_init);
 module_exit(monster_exit);
-
