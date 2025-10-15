@@ -40,6 +40,11 @@ Think of it as a hybrid between a game and a systems-engineering dojo. While you
 2. Insert it into the kernel: `sudo insmod quests/monster/monster.ko`
 3. Connect to your monster: `./quests/monster/monster_client.py`
 
+### Client Tips
+- Use `--theme minimal` for a bare-text view or stick with the default HUD theme for dynamic stage/quest/toolbars.
+- The client understands local helpers: `/summary`, `/filter ±tip`, `/filters`, `/help`.
+- Command autocompletion adapts to the monster’s current stage; the bottom toolbar highlights unlocked verbs and quest goals.
+
 ### Testing
 - Run the fast client tests: `python -m pytest quests/monster/tests/test_monster_client.py`
 - With the module loaded (`sudo insmod quests/monster/monster.ko`): `python -m pytest quests/monster/tests/test_monster_device.py`
