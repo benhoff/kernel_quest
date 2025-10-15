@@ -3,6 +3,8 @@
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/miscdevice.h>
+#include <linux/device.h>
+#include <linux/sysfs.h>
 #include <linux/uaccess.h>
 #include <linux/kfifo.h>
 #include <linux/poll.h>
@@ -20,6 +22,7 @@ MODULE_DESCRIPTION("Kernel Caretakers — cooperative kernel critter simulation"
 static unsigned int tick_ms = 250;
 static struct delayed_work tick_work;
 static bool tick_work_ready;
+static bool monster_sysfs_ready;
 
 static unsigned int clamp_tick_ms(unsigned int v)
 {
@@ -230,6 +233,86 @@ static struct miscdevice monster_miscdev = {
 	.mode  = 0666,
 };
 
+static const char *monster_state_label(enum monster_mood_state st)
+{
+	switch (st) {
+	case MONSTER_SLEEPING: return "sleeping";
+	case MONSTER_HUNGRY: return "hungry";
+	case MONSTER_CONTENT: return "content";
+	case MONSTER_OVERFED: return "overfed";
+	case MONSTER_GLITCHING: return "glitching";
+	default: return "unknown";
+	}
+}
+
+static ssize_t status_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct monster_game_stats stats;
+
+	monster_game_get_stats(&stats);
+
+	return sysfs_emit(buf,
+			  "tick: %u\n"
+			  "stability: %d\n"
+			  "hunger: %d\n"
+			  "mood: %d\n"
+			  "trust: %d\n"
+			  "junk_load: %d\n"
+			  "daemon_lost: %u\n"
+			  "monster_state: %s\n"
+			  "lifecycle: %s\n",
+			  stats.tick,
+			  stats.stability,
+			  stats.hunger,
+			  stats.mood,
+			  stats.trust,
+			  stats.junk_load,
+			  stats.daemon_lost ? 1 : 0,
+			  monster_state_label(stats.monster_state),
+			  monster_game_stage_name(stats.lifecycle));
+}
+static DEVICE_ATTR_RO(status);
+
+static ssize_t helpers_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct monster_game_stats stats;
+	bool first = true;
+	ssize_t len = 0;
+
+	monster_game_get_stats(&stats);
+
+	len += sysfs_emit(buf + len, "mask: 0x%x", stats.helper_mask);
+
+	if (stats.helper_mask & MONSTER_HELPER_MEMORY_SPRITE) {
+		len += sysfs_emit(buf + len, "%s memory_sprite", first ? " [" : " ");
+		first = false;
+	}
+	if (stats.helper_mask & MONSTER_HELPER_SCHED_BLESSING) {
+		len += sysfs_emit(buf + len, "%s scheduler_blessing", first ? " [" : " ");
+		first = false;
+	}
+	if (stats.helper_mask & MONSTER_HELPER_IO_PIXIE) {
+		len += sysfs_emit(buf + len, "%s io_pixie", first ? " [" : " ");
+		first = false;
+	}
+	if (!first)
+		len += sysfs_emit(buf + len, "]");
+
+	len += sysfs_emit(buf + len, "\n");
+	return len;
+}
+static DEVICE_ATTR_RO(helpers);
+
+static struct attribute *monster_attrs[] = {
+	&dev_attr_status.attr,
+	&dev_attr_helpers.attr,
+	NULL,
+};
+
+static const struct attribute_group monster_attr_group = {
+	.attrs = monster_attrs,
+};
+
 static int __init monster_init(void)
 {
 	int ret;
@@ -258,6 +341,17 @@ static int __init monster_init(void)
 		return ret;
 	}
 
+	ret = sysfs_create_group(&monster_miscdev.this_device->kobj, &monster_attr_group);
+	if (ret) {
+		misc_deregister(&monster_miscdev);
+		WRITE_ONCE(tick_work_ready, false);
+		cancel_delayed_work_sync(&tick_work);
+		monster_game_shutdown_sessions(monster_cleanup_session);
+		monster_game_exit();
+		return ret;
+	}
+	monster_sysfs_ready = true;
+
 	pr_info("monster: loaded at /dev/monster (tick_ms=%u)\n", tick_ms);
 	return 0;
 }
@@ -268,6 +362,9 @@ static void __exit monster_exit(void)
 	cancel_delayed_work_sync(&tick_work);
 
 	monster_game_shutdown_sessions(monster_cleanup_session);
+	if (monster_sysfs_ready && monster_miscdev.this_device)
+		sysfs_remove_group(&monster_miscdev.this_device->kobj, &monster_attr_group);
+	monster_sysfs_ready = false;
 	misc_deregister(&monster_miscdev);
 	monster_game_exit();
 

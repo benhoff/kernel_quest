@@ -20,12 +20,20 @@ Think of it as a hybrid between a game and a systems-engineering dojo. While you
 - Event loops and state machines
 - Scheduling, timing, and synchronization practices
 
+## Lifecycle & Progression
+- The monster grows through five lifecycle stages — Hatchling → Growing → Mature → Elder → Retired — each announced over `/dev/monster` and exported in sysfs.
+- Every stage unlocks fresh commands; attempt a future ability early and the kernel nudges you with a friendly `[TIP]` about the required stage.
+- Stage transitions rebalance spawn rates and enable spicier events (glitch storms wait until Elder), keeping early play sessions calm.
+- Each milestone broadcasts a `[QUEST]` goal (tick targets and stability expectations) so new helpers always know the next objective.
+- The client’s bottom toolbar mirrors stage/command availability live, and logs the latest quest hint.
+
 ## Project Structure
 - `quests/monster/monster_main.c` — kernel-facing entry: module params, workqueue, misc device glue.
 - `quests/monster/monster_game.c` — gameplay engine, state machine, command handlers, broadcast logic.
 - `quests/monster/monster_game.h` — shared types/API so the kernel layer can drive the game loop.
 - `quests/monster/monster_client.py` — interactive userspace client.
 - `quests/monster/tests/` — pytest suites: fast client/unit coverage and optional `/dev/monster` integration checks.
+- Sysfs: `/sys/class/misc/monster/status` and `/sys/class/misc/monster/helpers` expose live state snapshots for tooling.
 
 ## Getting Started
 1. Build the module: `make -C quests/monster`

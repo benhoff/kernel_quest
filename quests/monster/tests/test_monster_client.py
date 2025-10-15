@@ -109,3 +109,35 @@ def test_main_runs_startup_commands_and_skips_interactive(monkeypatch):
     assert client.stopped
     assert client.closed
     assert exit_code == 0
+
+
+def test_lifecycle_message_updates_stage(monkeypatch):
+    client = monster_client.MonsterClient(msg_prefix="[test] ")
+    messages = []
+    monkeypatch.setattr(monster_client, "HAVE_PT", False)
+    monkeypatch.setattr(monster_client, "print", lambda msg, flush=True: messages.append(msg), raising=False)
+
+    client._print_msg("[LIFECYCLE] Stage advanced to Growing!")
+    assert client._stage == "Growing"
+
+    client._print_msg("[LIFECYCLE] Current stage: Hatchling.")
+    assert client._stage == "Hatchling"
+
+
+def test_tip_commands_available_updates_toolbar(monkeypatch):
+    client = monster_client.MonsterClient(msg_prefix="[test] ")
+    client._stage = "Growing"
+    monkeypatch.setattr(monster_client, "HAVE_PT", False)
+    client._handle_tip_msg("[TIP] Commands available: look, go, state, grab <item>, feed <slot>.")
+
+    assert "grab <item>" in client._available_commands
+    assert "Stage: Growing" in client._toolbar_text
+    assert "feed <slot>" in client._toolbar_text
+
+
+def test_quest_message_tracks_last(monkeypatch):
+    client = monster_client.MonsterClient(msg_prefix="[test] ")
+    monkeypatch.setattr(monster_client, "HAVE_PT", False)
+    client._print_msg("[QUEST] Goal: reach Growing (tick 120+, stability 40+).")
+
+    assert client._last_quest == "[QUEST] Goal: reach Growing (tick 120+, stability 40+)."

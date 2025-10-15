@@ -14,6 +14,7 @@ import selectors
 import signal
 import threading
 import time
+import re
 
 def eprint(*a, **k):
     print(*a, file=sys.stderr, **k)
@@ -49,6 +50,11 @@ class MonsterClient:
         self._use_colors = use_colors
         self._msg_prefix = msg_prefix
         self._last_state = None
+        self._stage = None
+        self._available_commands = []
+        self._toolbar_text = "Stage: ? | Commands: look, go, state"
+        self._last_tip = None
+        self._last_quest = None
 
     # ---- device I/O -----------------------------------------------------
 
@@ -98,6 +104,12 @@ class MonsterClient:
         lower = text.lower()
         if "[state]" in lower:
             self._last_state = text
+        if text.startswith("[LIFECYCLE]"):
+            self._handle_lifecycle_msg(text)
+        if text.startswith("[TIP]"):
+            self._handle_tip_msg(text)
+        if text.startswith("[QUEST]"):
+            self._last_quest = text
         if HAVE_PT:
             if self._use_colors:
                 # dim prefix using ANSI escape; body normal
@@ -107,6 +119,39 @@ class MonsterClient:
             print_formatted_text(ANSI(colorized))
         else:
             print(f"{self._msg_prefix}{text}", flush=True)
+
+    def _handle_lifecycle_msg(self, text: str):
+        match = re.search(r"Stage\s+advanced\s+to\s*([A-Za-z]+)", text, re.IGNORECASE)
+        if not match:
+            match = re.search(r"current\s+stage\s*:?[\s]*([A-Za-z]+)", text, re.IGNORECASE)
+        if not match:
+            match = re.search(r"Stage\s*:?[\s]*([A-Za-z]+)", text, re.IGNORECASE)
+        if match:
+            self._stage = match.group(1)
+            self._refresh_toolbar()
+
+    def _handle_tip_msg(self, text: str):
+        self._last_tip = text
+        if "Commands available:" in text:
+            _, tail = text.split("Commands available:", 1)
+            commands = [segment.strip().strip('.') for segment in tail.split(',') if segment.strip()]
+            self._available_commands = commands
+            self._refresh_toolbar()
+
+    def _refresh_toolbar(self):
+        stage = self._stage or "?"
+        if self._available_commands:
+            preview = ", ".join(self._available_commands[:7])
+            if len(self._available_commands) > 7:
+                preview += ", …"
+        else:
+            preview = "look, go, state"
+        self._toolbar_text = f"Stage: {stage} | Commands: {preview}"
+        if self._session:
+            try:
+                self._session.app.invalidate()
+            except Exception:
+                pass
 
     # ---- reading thread --------------------------------------------------
 
@@ -220,12 +265,15 @@ def main():
     # Interactive loop
     if HAVE_PT:
         # Persistent commands reminder in the bottom toolbar
-        help_text = "Commands: login <name>, look, go <dir>, grab, analyze, feed, clean, rescue, clear, pet, debug, sing, inventory, state, say <msg>, reset, quit"
-        # Escape '<' and '>' so HTML parser doesn't choke on <name>/<msg>
-        toolbar = HTML(f'<ansigray>{escape(help_text)}</ansigray>') if HTML else help_text
+        help_text = "Stage: ? | Commands: look, go, state"
+        client._toolbar_text = help_text
+
+        def toolbar_provider():
+            return HTML(f'<ansigray>{escape(client._toolbar_text)}</ansigray>') if HTML else client._toolbar_text
+
         session = PromptSession(
             "> ",
-            bottom_toolbar=toolbar,
+            bottom_toolbar=toolbar_provider,
         )
         client.set_session(session)
         try:

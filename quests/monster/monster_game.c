@@ -20,6 +20,46 @@
 #define MOOD_MAX          10
 #define TRUST_MAX         10
 
+static const char * const monster_stage_names[STAGE_COUNT] = {
+	[STAGE_HATCHLING] = "Hatchling",
+	[STAGE_GROWING] = "Growing",
+	[STAGE_MATURE] = "Mature",
+	[STAGE_ELDER] = "Elder",
+	[STAGE_RETIRED] = "Retired",
+};
+
+struct stage_rule {
+	enum monster_stage stage;
+	u32 min_tick;
+	s32 min_stability;
+};
+
+static const struct stage_rule stage_rules[] = {
+	{ STAGE_GROWING, 120, 40 },
+	{ STAGE_MATURE, 280, 55 },
+	{ STAGE_ELDER, 480, 65 },
+	{ STAGE_RETIRED, 720, 75 },
+};
+
+struct command_gate {
+	const char *cmd;
+	const char *display;
+	enum monster_stage stage;
+};
+
+static const struct command_gate command_gates[] = {
+	{ "grab",     "grab <item>",   STAGE_GROWING },
+	{ "analyze",  "analyze <slot>", STAGE_GROWING },
+	{ "feed",     "feed <slot>",    STAGE_GROWING },
+	{ "clean",    "clean <slot>",   STAGE_MATURE },
+	{ "rescue",   "rescue",         STAGE_MATURE },
+	{ "clear",    "clear",          STAGE_MATURE },
+	{ "pet",      "pet",            STAGE_ELDER },
+	{ "debug",    "debug",          STAGE_ELDER },
+	{ "sing",     "sing",           STAGE_ELDER },
+	{ "reset",    "reset",          STAGE_RETIRED },
+};
+
 
 /* Optional deterministic RNG seed (0 = use kernel randomness) */
 static unsigned int rng_seed = 0;
@@ -102,26 +142,11 @@ struct actor {
 	u8 selected_slot;     /* optional quick slot */
 };
 
-enum helper_kind {
-	HELPER_NONE = 0,
-	HELPER_MEMORY_SPRITE = BIT(0),
-	HELPER_SCHED_BLESSING = BIT(1),
-	HELPER_IO_PIXIE = BIT(2),
-};
-
 struct helper_state {
-	u8 helpers;           /* bitmask of helper_kind */
+	u8 helpers;           /* bitmask of MONSTER_HELPER_* flags */
 	u8 happy_streak;
 	u8 rescue_counter;
 	u32 survived_ticks;
-};
-
-enum monster_mood_state {
-	MONSTER_SLEEPING = 0,
-	MONSTER_HUNGRY,
-	MONSTER_CONTENT,
-	MONSTER_OVERFED,
-	MONSTER_GLITCHING,
 };
 
 struct system_state {
@@ -135,6 +160,7 @@ struct system_state {
 	enum monster_mood_state monster_state;
 	struct helper_state helper;
 	bool crashed;
+	enum monster_stage lifecycle;
 };
 
 static DEFINE_MUTEX(world_lock); /* guards world + room actors */
@@ -153,6 +179,186 @@ static struct rnd_state rng_state;
 static void recompute_monster_state(void);
 static void broadcast_all_locked(const char *fmt, ...);
 static void broadcast_all_locked_v(const char *fmt, va_list ap);
+static void announce_stage_unlocks_locked(enum monster_stage stage);
+static bool command_permitted(struct monster_session *s, const char *cmd);
+static void emit_available_commands(struct monster_session *s);
+static void broadcast_available_commands_locked(void);
+static void sess_emit(struct monster_session *s, const char *fmt, ...);
+static void announce_next_goal_locked(enum monster_stage stage);
+static void emit_next_goal(struct monster_session *s);
+static const struct stage_rule *next_stage_rule(enum monster_stage stage);
+static void stage_spawn_thresholds(enum monster_stage stage, u8 *resource_pct, u8 *daemon_pct);
+
+const char *monster_game_stage_name(enum monster_stage stage)
+{
+	if (stage < 0 || stage >= STAGE_COUNT)
+		return "Unknown";
+	return monster_stage_names[stage];
+}
+
+
+static void maybe_advance_lifecycle_locked(void)
+{
+	enum monster_stage stage_cur = sys_state.lifecycle;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(stage_rules); i++) {
+		const struct stage_rule *rule = &stage_rules[i];
+
+		if (rule->stage <= stage_cur)
+			continue;
+		if (sys_state.tick < rule->min_tick)
+			break;
+		if (sys_state.stability < rule->min_stability)
+			break;
+
+		sys_state.lifecycle = rule->stage;
+		stage_cur = sys_state.lifecycle;
+		broadcast_all_locked("[LIFECYCLE] Stage advanced to %s!\n",
+			monster_game_stage_name(rule->stage));
+		announce_stage_unlocks_locked(rule->stage);
+		broadcast_available_commands_locked();
+		announce_next_goal_locked(sys_state.lifecycle);
+	}
+}
+
+static const struct command_gate *find_gate(const char *cmd)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(command_gates); i++)
+		if (!strcmp(command_gates[i].cmd, cmd))
+			return &command_gates[i];
+
+	return NULL;
+}
+
+static size_t format_available_commands(enum monster_stage stage, char *buf, size_t size)
+{
+	size_t len = scnprintf(buf, size,
+		"look, go <dir>, state, inventory, say <msg>, quit");
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(command_gates); i++) {
+		const struct command_gate *gate = &command_gates[i];
+
+		if (stage < gate->stage)
+			continue;
+		len += scnprintf(buf + len, size - len, ", %s",
+			gate->display);
+	}
+	return len;
+}
+
+static const struct stage_rule *next_stage_rule(enum monster_stage stage)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(stage_rules); i++) {
+		if (stage_rules[i].stage > stage)
+			return &stage_rules[i];
+	}
+	return NULL;
+}
+
+static void announce_stage_unlocks_locked(enum monster_stage stage)
+{
+	char buf[MONSTER_MAX_LINE];
+	size_t len = 0;
+	bool first = true;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(command_gates); i++) {
+		const struct command_gate *gate = &command_gates[i];
+
+		if (gate->stage != stage)
+			continue;
+		if (first) {
+			len = scnprintf(buf, sizeof(buf),
+				"[TIP] Commands unlocked at %s: %s",
+				monster_game_stage_name(stage), gate->display);
+			first = false;
+		} else {
+			len += scnprintf(buf + len, sizeof(buf) - len,
+				", %s", gate->display);
+		}
+	}
+	if (first)
+		return;
+	len += scnprintf(buf + len, sizeof(buf) - len, "\n");
+	broadcast_all_locked("%s", buf);
+}
+
+static void announce_next_goal_locked(enum monster_stage stage)
+{
+	const struct stage_rule *next = next_stage_rule(stage);
+
+	if (!next) {
+		broadcast_all_locked("[QUEST] The Friendly Monster is retired. Enjoy free play!\n");
+		return;
+	}
+
+	broadcast_all_locked("[QUEST] Goal: reach %s (tick %u+, stability %d+).\n",
+		monster_game_stage_name(next->stage),
+		next->min_tick,
+		next->min_stability);
+}
+
+static bool command_permitted(struct monster_session *s, const char *cmd)
+{
+	const struct command_gate *gate = find_gate(cmd);
+	enum monster_stage required = gate ? gate->stage : STAGE_HATCHLING;
+	enum monster_stage stage = READ_ONCE(sys_state.lifecycle);
+	const char *label = gate ? gate->display : cmd;
+
+	if (stage >= required)
+		return true;
+
+	sess_emit(s,
+		"[TIP] '%s' unlocks at stage %s (current: %s).\n",
+		label,
+		monster_game_stage_name(required),
+		monster_game_stage_name(stage));
+	return false;
+}
+
+static void emit_available_commands(struct monster_session *s)
+{
+	char buf[MONSTER_MAX_LINE];
+	enum monster_stage stage = READ_ONCE(sys_state.lifecycle);
+
+	format_available_commands(stage, buf, sizeof(buf));
+	sess_emit(s, "[TIP] Commands available: %s\n", buf);
+}
+
+static void broadcast_available_commands_locked(void)
+{
+	char buf[MONSTER_MAX_LINE];
+	size_t len;
+
+	len = format_available_commands(sys_state.lifecycle, buf, sizeof(buf));
+	len += scnprintf(buf + len, sizeof(buf) - len, "\n");
+	broadcast_all_locked("[TIP] Commands available: %s", buf);
+}
+
+static void emit_next_goal(struct monster_session *s)
+{
+	char buf[MONSTER_MAX_LINE];
+	enum monster_stage stage = READ_ONCE(sys_state.lifecycle);
+	const struct stage_rule *next = next_stage_rule(stage);
+
+	if (!next) {
+		sess_emit(s, "[QUEST] The Friendly Monster is retired. Enjoy free play!\n");
+		return;
+	}
+
+	scnprintf(buf, sizeof(buf),
+		"[QUEST] Goal: reach %s (tick %u+, stability %d+).\n",
+		monster_game_stage_name(next->stage),
+		next->min_tick,
+		next->min_stability);
+	sess_emit(s, "%s", buf);
+}
 
 
 /* ---- Helpers ----------------------------------------------------------- */
@@ -284,6 +490,7 @@ static void game_reset_state(void)
 	sys_state.helper.rescue_counter = 0;
 	sys_state.helper.survived_ticks = 0;
 	sys_state.crashed = false;
+	sys_state.lifecycle = STAGE_HATCHLING;
 	recompute_monster_state();
 }
 
@@ -413,9 +620,38 @@ static void spawn_daemon_locked(char *logbuf, size_t buflen)
 		scnprintf(logbuf, buflen, "[ALERT] A baby daemon wanders into /dev/null/fields!\n");
 }
 
+static void stage_spawn_thresholds(enum monster_stage stage, u8 *resource_pct,
+	u8 *daemon_pct)
+{
+	switch (stage) {
+	case STAGE_HATCHLING:
+		*resource_pct = 40;
+		*daemon_pct = 10;
+		break;
+	case STAGE_GROWING:
+		*resource_pct = 55;
+		*daemon_pct = 15;
+		break;
+	case STAGE_MATURE:
+		*resource_pct = 65;
+		*daemon_pct = 25;
+		break;
+	case STAGE_ELDER:
+		*resource_pct = 70;
+		*daemon_pct = 30;
+		break;
+	case STAGE_RETIRED:
+	default:
+		*resource_pct = 75;
+		*daemon_pct = 35;
+		break;
+	}
+}
+
 struct game_event {
 	const char *name;
 	u8 weight;
+	enum monster_stage min_stage;
 	void (*fn)(char *buf, size_t len);
 };
 
@@ -476,11 +712,11 @@ static void event_lucky_sync(char *buf, size_t len)
 }
 
 static const struct game_event game_events[] = {
-	{ "Resource mutation", 20, event_resource_mutation },
-	{ "Mood swing", 20, event_mood_swing },
-	{ "Lost process", 15, event_lost_process },
-	{ "Glitch storm", 15, event_glitch_storm },
-	{ "Lucky sync", 20, event_lucky_sync },
+	{ "Resource mutation", 20, STAGE_GROWING, event_resource_mutation },
+	{ "Mood swing", 20, STAGE_HATCHLING, event_mood_swing },
+	{ "Lost process", 15, STAGE_MATURE, event_lost_process },
+	{ "Glitch storm", 15, STAGE_ELDER, event_glitch_storm },
+	{ "Lucky sync", 20, STAGE_HATCHLING, event_lucky_sync },
 };
 #define GAME_EVENT_COUNT (sizeof(game_events)/sizeof(game_events[0]))
 
@@ -489,17 +725,25 @@ static void run_random_event_locked(void)
 	u32 total = 0, pick, accum = 0;
 	u32 i;
 	char buf[MONSTER_MAX_LINE] = "";
+	enum monster_stage stage = sys_state.lifecycle;
 
-	for (i = 0; i < GAME_EVENT_COUNT; i++)
+	for (i = 0; i < GAME_EVENT_COUNT; i++) {
+		if (stage < game_events[i].min_stage)
+			continue;
 		total += game_events[i].weight;
+	}
 	if (!total)
 		return;
 	pick = rand_u32() % total;
 	for (i = 0; i < GAME_EVENT_COUNT; i++) {
-		accum += game_events[i].weight;
+		const struct game_event *ev = &game_events[i];
+
+		if (stage < ev->min_stage)
+			continue;
+		accum += ev->weight;
 		if (pick < accum) {
-			if (game_events[i].fn)
-				game_events[i].fn(buf, sizeof(buf));
+			if (ev->fn)
+				ev->fn(buf, sizeof(buf));
 			break;
 		}
 	}
@@ -510,13 +754,16 @@ static void run_random_event_locked(void)
 static void spawn_phase_locked(void)
 {
 	char buf[MONSTER_MAX_LINE] = "";
-	if (rand_percent() < 65)
+	u8 resource_pct, daemon_pct;
+
+	stage_spawn_thresholds(sys_state.lifecycle, &resource_pct, &daemon_pct);
+	if (rand_percent() < resource_pct)
 		spawn_buffet_resource_locked(buf, sizeof(buf));
 	if (buf[0])
 		broadcast_all_locked("%s", buf);
 
 	buf[0] = '\0';
-	if (rand_percent() < 25)
+	if (rand_percent() < daemon_pct)
 		spawn_daemon_locked(buf, sizeof(buf));
 	if (buf[0])
 		broadcast_all_locked("%s", buf);
@@ -532,7 +779,7 @@ static void cleanup_phase_locked(void)
 static void update_phase_locked(void)
 {
 	char buf[MONSTER_MAX_LINE] = "";
-	int hunger_gain = (sys_state.helper.helpers & HELPER_SCHED_BLESSING) ? 0 : 1;
+	int hunger_gain = (sys_state.helper.helpers & MONSTER_HELPER_SCHED_BLESSING) ? 0 : 1;
 	adjust_hunger(hunger_gain);
 	if (sys_state.hunger >= 8)
 		adjust_stability(-3);
@@ -567,9 +814,9 @@ static void helper_phase_locked(void)
 	char buf[MONSTER_MAX_LINE] = "";
 	sys_state.helper.survived_ticks++;
 
-	if (!(sys_state.helper.helpers & HELPER_MEMORY_SPRITE) &&
+	if (!(sys_state.helper.helpers & MONSTER_HELPER_MEMORY_SPRITE) &&
 	    sys_state.helper.survived_ticks >= 20) {
-		sys_state.helper.helpers |= HELPER_MEMORY_SPRITE;
+		sys_state.helper.helpers |= MONSTER_HELPER_MEMORY_SPRITE;
 		scnprintf(buf, sizeof(buf), "[HELPER] Memory Sprite joins you, whisking junk away!\n");
 	}
 	if (buf[0]) {
@@ -582,9 +829,9 @@ static void helper_phase_locked(void)
 	else
 		sys_state.helper.happy_streak = 0;
 
-	if (!(sys_state.helper.helpers & HELPER_SCHED_BLESSING) &&
+	if (!(sys_state.helper.helpers & MONSTER_HELPER_SCHED_BLESSING) &&
 	    sys_state.helper.happy_streak >= 10) {
-		sys_state.helper.helpers |= HELPER_SCHED_BLESSING;
+		sys_state.helper.helpers |= MONSTER_HELPER_SCHED_BLESSING;
 		scnprintf(buf, sizeof(buf), "[HELPER] Scheduler Blessing granted: hunger gain slowed!\n");
 	}
 	if (buf[0]) {
@@ -592,9 +839,9 @@ static void helper_phase_locked(void)
 		buf[0] = '\0';
 	}
 
-	if (!(sys_state.helper.helpers & HELPER_IO_PIXIE) &&
+	if (!(sys_state.helper.helpers & MONSTER_HELPER_IO_PIXIE) &&
 	    sys_state.helper.rescue_counter >= 3) {
-		sys_state.helper.helpers |= HELPER_IO_PIXIE;
+		sys_state.helper.helpers |= MONSTER_HELPER_IO_PIXIE;
 		scnprintf(buf, sizeof(buf), "[HELPER] IO Pixie flits in to rescue strays!\n");
 	}
 	if (buf[0]) {
@@ -602,7 +849,7 @@ static void helper_phase_locked(void)
 		buf[0] = '\0';
 	}
 
-	if (sys_state.helper.helpers & HELPER_MEMORY_SPRITE) {
+	if (sys_state.helper.helpers & MONSTER_HELPER_MEMORY_SPRITE) {
 		if (sys_state.junk_load > 0) {
 			int before = sys_state.junk_load;
 			adjust_junk(-1);
@@ -615,7 +862,7 @@ static void helper_phase_locked(void)
 		buf[0] = '\0';
 	}
 
-	if (sys_state.helper.helpers & HELPER_IO_PIXIE) {
+	if (sys_state.helper.helpers & MONSTER_HELPER_IO_PIXIE) {
 		int i;
 		for (i = 0; i < ROOM_MAX_OBJECTS; i++) {
 			struct room_object *o = &room_objects[ROOM_FIELDS][i];
@@ -848,11 +1095,11 @@ static void look_room_unlocked(struct monster_session *s)
 		sys_state.daemon_lost ? " daemon-lost" : "");
 	if (sys_state.helper.helpers) {
 		sess_emit(s, "[HELPERS] ");
-		if (sys_state.helper.helpers & HELPER_MEMORY_SPRITE)
+		if (sys_state.helper.helpers & MONSTER_HELPER_MEMORY_SPRITE)
 			sess_emit(s, "MemorySprite ");
-		if (sys_state.helper.helpers & HELPER_SCHED_BLESSING)
+		if (sys_state.helper.helpers & MONSTER_HELPER_SCHED_BLESSING)
 			sess_emit(s, "SchedulerBlessing ");
-		if (sys_state.helper.helpers & HELPER_IO_PIXIE)
+		if (sys_state.helper.helpers & MONSTER_HELPER_IO_PIXIE)
 			sess_emit(s, "IOPixie ");
 		sess_emit(s, "\n");
 	}
@@ -860,6 +1107,8 @@ static void look_room_unlocked(struct monster_session *s)
 	if (s->player->room_id == ROOM_NURSERY) {
 		sess_emit(s, "[MONSTER] The Friendly Monster is %s.\n",
 			monster_state_name(sys_state.monster_state));
+		sess_emit(s, "[LIFECYCLE] Stage %s.\n",
+			monster_game_stage_name(sys_state.lifecycle));
 	}
 
 	sess_emit(s, "Objects here:\n");
@@ -920,7 +1169,10 @@ static void cmd_login(struct monster_session *s, const char *arg)
 	s->player = a;
 
 	sess_emit(s, "[PROC] Helper thread %s spawned.\n", a->name);
-	sess_emit(s, "[TIP] Commands: look, go <dir>, grab <item>, analyze <slot>, feed <slot>, clean <slot>, rescue, clear, pet, debug, sing, inventory, state, say <msg>, reset, quit\n");
+	sess_emit(s, "[LIFECYCLE] Current stage: %s.\n",
+		monster_game_stage_name(READ_ONCE(sys_state.lifecycle)));
+	emit_available_commands(s);
+	emit_next_goal(s);
 	look_room_unlocked(s);
 }
 
@@ -1322,6 +1574,8 @@ static bool cmd_reset(struct monster_session *s)
 			place_actor_in_room(a, room_valid(start_room) ? start_room : ROOM_NURSERY);
 		}
 	}
+	announce_next_goal_locked(sys_state.lifecycle);
+	broadcast_available_commands_locked();
 	mutex_unlock(&world_lock);
 
 	broadcast_all("[PROC] %s restores the kernel. New shift begins!\n", p->name);
@@ -1350,6 +1604,7 @@ bool monster_game_tick(void)
 	run_random_event_locked();
 	helper_phase_locked();
 	cleanup_phase_locked();
+	maybe_advance_lifecycle_locked();
 
 	if (sys_state.stability <= 0)
 		crash_reason = "stability exhausted";
@@ -1371,6 +1626,25 @@ bool monster_game_tick(void)
 	return crashed_now;
 }
 
+void monster_game_get_stats(struct monster_game_stats *stats)
+{
+	if (!stats)
+		return;
+
+	mutex_lock(&world_lock);
+	stats->tick = sys_state.tick;
+	stats->stability = sys_state.stability;
+	stats->hunger = sys_state.hunger;
+	stats->mood = sys_state.mood;
+	stats->trust = sys_state.trust;
+	stats->junk_load = sys_state.junk_load;
+	stats->daemon_lost = sys_state.daemon_lost;
+	stats->helper_mask = sys_state.helper.helpers;
+	stats->monster_state = sys_state.monster_state;
+	stats->lifecycle = sys_state.lifecycle;
+	mutex_unlock(&world_lock);
+}
+
 unsigned int monster_game_handle_line(struct monster_session *s, char *line)
 {
 	unsigned int events = MONSTER_GAME_EVENT_NONE;
@@ -1386,16 +1660,54 @@ unsigned int monster_game_handle_line(struct monster_session *s, char *line)
 	if (!strcmp(line, "login"))           cmd_login(s, arg);
 	else if (!strcmp(line, "look"))       cmd_look(s);
 	else if (!strcmp(line, "go"))         cmd_go(s, arg);
-	else if (!strcmp(line, "grab"))       cmd_grab(s, arg);
-	else if (!strcmp(line, "analyze"))    cmd_analyze(s, arg);
-	else if (!strcmp(line, "feed"))       cmd_feed(s, arg);
-	else if (!strcmp(line, "clean"))      cmd_clean(s, arg);
-	else if (!strcmp(line, "rescue"))     cmd_rescue(s);
-	else if (!strcmp(line, "clear"))      cmd_clear(s);
-	else if (!strcmp(line, "pet"))        cmd_pet(s);
-	else if (!strcmp(line, "debug"))      cmd_debug(s);
-	else if (!strcmp(line, "sing"))       cmd_sing(s);
+	else if (!strcmp(line, "grab")) {
+		if (!command_permitted(s, "grab"))
+			return events;
+		cmd_grab(s, arg);
+	}
+	else if (!strcmp(line, "analyze")) {
+		if (!command_permitted(s, "analyze"))
+			return events;
+		cmd_analyze(s, arg);
+	}
+	else if (!strcmp(line, "feed")) {
+		if (!command_permitted(s, "feed"))
+			return events;
+		cmd_feed(s, arg);
+	}
+	else if (!strcmp(line, "clean")) {
+		if (!command_permitted(s, "clean"))
+			return events;
+		cmd_clean(s, arg);
+	}
+	else if (!strcmp(line, "rescue")) {
+		if (!command_permitted(s, "rescue"))
+			return events;
+		cmd_rescue(s);
+	}
+	else if (!strcmp(line, "clear")) {
+		if (!command_permitted(s, "clear"))
+			return events;
+		cmd_clear(s);
+	}
+	else if (!strcmp(line, "pet")) {
+		if (!command_permitted(s, "pet"))
+			return events;
+		cmd_pet(s);
+	}
+	else if (!strcmp(line, "debug")) {
+		if (!command_permitted(s, "debug"))
+			return events;
+		cmd_debug(s);
+	}
+	else if (!strcmp(line, "sing")) {
+		if (!command_permitted(s, "sing"))
+			return events;
+		cmd_sing(s);
+	}
 	else if (!strcmp(line, "reset")) {
+		if (!command_permitted(s, "reset"))
+			return events;
 		if (cmd_reset(s))
 			events |= MONSTER_GAME_EVENT_RESET;
 	}
