@@ -1,0 +1,17 @@
+# Kernel build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.order
+*.symvers
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Python bytecode caches
+__pycache__/
+*.pyc
+*.pyo
