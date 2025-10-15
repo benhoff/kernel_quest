@@ -46,10 +46,13 @@ def test_print_msg_plain_mode_updates_last_state(monkeypatch):
     monkeypatch.setattr(monster_client, "HAVE_PT", False)
     monkeypatch.setattr(monster_client, "print", lambda msg, flush=True: messages.append(msg), raising=False)
 
-    client._print_msg("[STATE] idle")
+    client._print_msg("[STATE] stability=78 hunger=2 mood=4 trust=5 tick=123 junk=3 daemon_lost=no")
 
-    assert client._last_state == "[STATE] idle"
-    assert messages == ["[test] [STATE] idle"]
+    assert client._last_state == "[STATE] stability=78 hunger=2 mood=4 trust=5 tick=123 junk=3 daemon_lost=no"
+    assert client._stats["stability"] == 78
+    assert client._stats["hunger"] == 2
+    assert client._stats["daemon_lost"] is False
+    assert messages == ["[test] [STATE] stability=78 hunger=2 mood=4 trust=5 tick=123 junk=3 daemon_lost=no"]
 
 
 def test_main_runs_startup_commands_and_skips_interactive(monkeypatch):
@@ -141,3 +144,7 @@ def test_quest_message_tracks_last(monkeypatch):
     client._print_msg("[QUEST] Goal: reach Growing (tick 120+, stability 40+).")
 
     assert client._last_quest == "[QUEST] Goal: reach Growing (tick 120+, stability 40+)."
+    assert client._quest_goal == {"stage": "Growing", "tick": 120, "stability": 40}
+
+    client._print_msg("[QUEST] The Friendly Monster is retired. Enjoy free play!")
+    assert client._quest_goal == {"stage": "Retired", "tick": None, "stability": None}

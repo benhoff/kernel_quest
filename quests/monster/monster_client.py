@@ -55,6 +55,8 @@ class MonsterClient:
         self._toolbar_text = "Stage: ? | Commands: look, go, state"
         self._last_tip = None
         self._last_quest = None
+        self._stats = {}
+        self._quest_goal = None
 
     # ---- device I/O -----------------------------------------------------
 
@@ -102,14 +104,16 @@ class MonsterClient:
         - Otherwise, print to stdout with a simple prefix.
         """
         lower = text.lower()
-        if "[state]" in lower:
+        if text.startswith("[STATE]"):
             self._last_state = text
+            self._handle_state_msg(text)
         if text.startswith("[LIFECYCLE]"):
             self._handle_lifecycle_msg(text)
         if text.startswith("[TIP]"):
             self._handle_tip_msg(text)
         if text.startswith("[QUEST]"):
             self._last_quest = text
+            self._handle_quest_msg(text)
         if HAVE_PT:
             if self._use_colors:
                 # dim prefix using ANSI escape; body normal
@@ -137,6 +141,49 @@ class MonsterClient:
             commands = [segment.strip().strip('.') for segment in tail.split(',') if segment.strip()]
             self._available_commands = commands
             self._refresh_toolbar()
+
+    STATE_PATTERN = re.compile(
+        r"stability=(?P<stability>-?\d+)\s+"
+        r"hunger=(?P<hunger>-?\d+)\s+"
+        r"mood=(?P<mood>-?\d+)\s+"
+        r"trust=(?P<trust>-?\d+)\s+"
+        r"tick=(?P<tick>\d+)\s+"
+        r"junk=(?P<junk>-?\d+)\s+"
+        r"(?:daemon_lost=(?P<daemon_lost>\w+))",
+        re.IGNORECASE,
+    )
+
+    QUEST_PATTERN = re.compile(
+        r"Goal:\s*reach\s+(?P<stage>[A-Za-z]+)\s*\(tick\s+(?P<tick>\d+)\+,\s*stability\s+(?P<stab>\d+)\+\)",
+        re.IGNORECASE,
+    )
+
+    def _handle_state_msg(self, text: str):
+        match = self.STATE_PATTERN.search(text)
+        if match:
+            parsed = match.groupdict()
+            parsed_int = {
+                key: (int(value) if key != "daemon_lost" else value.lower() in {"yes", "true", "1"})
+                for key, value in parsed.items()
+                if value is not None
+            }
+            self._stats = parsed_int
+
+    def _handle_quest_msg(self, text: str):
+        match = self.QUEST_PATTERN.search(text)
+        if match:
+            data = match.groupdict()
+            self._quest_goal = {
+                "stage": data["stage"],
+                "tick": int(data["tick"]),
+                "stability": int(data["stab"]),
+            }
+        elif "retired" in text.lower():
+            self._quest_goal = {
+                "stage": "Retired",
+                "tick": None,
+                "stability": None,
+            }
 
     def _refresh_toolbar(self):
         stage = self._stage or "?"
