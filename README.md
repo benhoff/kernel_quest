@@ -21,14 +21,21 @@ Think of it as a hybrid between a game and a systems-engineering dojo. While you
 - Scheduling, timing, and synchronization practices
 
 ## Project Structure
-- `quests/monster/monster_main.c` — core kernel module implementation.
+- `quests/monster/monster_main.c` — kernel-facing entry: module params, workqueue, misc device glue.
+- `quests/monster/monster_game.c` — gameplay engine, state machine, command handlers, broadcast logic.
+- `quests/monster/monster_game.h` — shared types/API so the kernel layer can drive the game loop.
 - `quests/monster/monster_client.py` — interactive userspace client.
-- `quests/monster/tests/` — unit tests (`python -m unittest discover quests/monster/tests`).
+- `quests/monster/tests/` — pytest suites: fast client/unit coverage and optional `/dev/monster` integration checks.
 
 ## Getting Started
 1. Build the module: `make -C quests/monster`
 2. Insert it into the kernel: `sudo insmod quests/monster/monster.ko`
 3. Connect to your monster: `./quests/monster/monster_client.py`
+
+### Testing
+- Run the fast client tests: `python -m pytest quests/monster/tests/test_monster_client.py`
+- With the module loaded (`sudo insmod quests/monster/monster.ko`): `python -m pytest quests/monster/tests/test_monster_device.py`
+- Or run everything (integration tests auto-skip if `/dev/monster` is absent): `python -m pytest quests/monster/tests`
 
 ## Why Build Games in the Kernel?
 Should you build games in the kernel? Probably not.
