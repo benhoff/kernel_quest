@@ -48,6 +48,7 @@ class MonsterClient:
         self._session = None
         self._use_colors = use_colors
         self._msg_prefix = msg_prefix
+        self._last_state = None
 
     # ---- device I/O -----------------------------------------------------
 
@@ -94,6 +95,9 @@ class MonsterClient:
         - With prompt_toolkit available, use print_formatted_text(ANSI(...)) so the prompt redraws cleanly.
         - Otherwise, print to stdout with a simple prefix.
         """
+        lower = text.lower()
+        if "[state]" in lower:
+            self._last_state = text
         if HAVE_PT:
             if self._use_colors:
                 # dim prefix using ANSI escape; body normal
@@ -173,6 +177,7 @@ def main():
     ap.add_argument("--encoding", default="utf-8", help="text encoding (default: utf-8)")
     ap.add_argument("--no-echo-prompt", action="store_true", help="do not print local prompt (plain mode only)")
     ap.add_argument("--no-color", action="store_true", help="disable colored device messages")
+    ap.add_argument("--status", action="store_true", help="print the latest [STATE] block on shutdown")
     args = ap.parse_args()
 
     client = MonsterClient(dev=args.dev, enc=args.encoding, use_colors=not args.no_color)
@@ -215,7 +220,7 @@ def main():
     # Interactive loop
     if HAVE_PT:
         # Persistent commands reminder in the bottom toolbar
-        help_text = "Commands: login <name>, look, go n|e|s|w, hide, fight, say <msg>, who, quit"
+        help_text = "Commands: login <name>, look, go <dir>, grab, analyze, feed, clean, rescue, clear, pet, debug, sing, inventory, state, say <msg>, reset, quit"
         # Escape '<' and '>' so HTML parser doesn't choke on <name>/<msg>
         toolbar = HTML(f'<ansigray>{escape(help_text)}</ansigray>') if HTML else help_text
         session = PromptSession(
@@ -263,8 +268,9 @@ def main():
 
     client.stop_reader()
     client.close()
+    if args.status and client._last_state:
+        print(f"{client._msg_prefix}{client._last_state}")
     return 0
 
 if __name__ == "__main__":
     sys.exit(main())
-
